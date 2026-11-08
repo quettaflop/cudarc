@@ -1,5 +1,6 @@
 use crate::driver::{
     result::{self, DriverError},
+    safe::block_cache::{size_class, BlockCache, StreamKey},
     sys::{self, CUfunc_cache_enum, CUfunction_attribute_enum},
 };
 
@@ -9,7 +10,7 @@ use std::{
     ops::{Bound, RangeBounds},
     string::String,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec::Vec,
 };
 
@@ -40,6 +41,8 @@ pub struct CudaContext {
     pub(crate) num_streams: AtomicUsize,
     pub(crate) event_tracking: AtomicBool,
     pub(crate) error_state: AtomicU32,
+    /// Freed blocks kept for reuse, once [CudaContext::cache_freed_blocks] is called.
+    pub(crate) block_cache: Mutex<Option<BlockCache>>,
 }
 
 unsafe impl Send for CudaContext {}
@@ -91,6 +94,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            block_cache: Mutex::new(None),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -163,6 +167,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            block_cache: Mutex::new(None),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -214,6 +219,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            block_cache: Mutex::new(None),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -251,6 +257,7 @@ impl CudaContext {
             num_streams: AtomicUsize::new(0),
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
+            block_cache: Mutex::new(None),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -273,6 +280,50 @@ impl CudaContext {
     /// over `cuMemAlloc` if this method returns `true`.
     pub fn has_async_alloc(&self) -> bool {
         self.has_async_alloc
+    }
+
+    /// Keeps device memory freed on a stream for that stream's next allocations of its size, up to
+    /// `limit` bytes in all, instead of returning it to the driver.
+    ///
+    /// `cuMemAllocAsync` and `cuMemFreeAsync` serialize across all the threads of a process, so
+    /// threads that drive different devices at once wait for each other on every allocation and
+    /// free (on 8 GPUs, about 25 us per allocation and free instead of 0.6 us). A cached block needs
+    /// no driver call. Blocks are rounded up to size classes, at most a quarter larger than the
+    /// allocations they serve. Allocations and frees on a capturing stream bypass the cache, and an
+    /// allocation that runs out of memory returns the cached blocks and tries again.
+    ///
+    /// Only for contexts that support asynchronous allocation ([CudaContext::has_async_alloc]).
+    pub fn cache_freed_blocks(&self, limit: usize) {
+        let mut cache = self.block_cache.lock().unwrap();
+        match cache.as_mut() {
+            Some(blocks) => blocks.set_limit(limit),
+            None => *cache = Some(BlockCache::new(limit)),
+        }
+    }
+
+    /// Bytes held by the block cache, see [CudaContext::cache_freed_blocks].
+    pub fn cached_bytes(&self) -> usize {
+        let cache = self.block_cache.lock().unwrap();
+        cache.as_ref().map_or(0, BlockCache::held)
+    }
+
+    /// Returns the blocks held by the block cache to the driver, after the work on every stream of
+    /// this context has finished.
+    pub fn release_cached_blocks(&self) -> Result<(), DriverError> {
+        let blocks = self
+            .block_cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|cache| cache.drain(|_| true));
+        let Some(blocks) = blocks.filter(|blocks| !blocks.is_empty()) else {
+            return Ok(());
+        };
+        self.synchronize()?;
+        for (_, block) in blocks {
+            unsafe { result::free_sync(block) }?;
+        }
+        Ok(())
     }
 
     /// The number of devices available.
@@ -639,6 +690,12 @@ unsafe impl Sync for CudaStream {}
 impl Drop for CudaStream {
     fn drop(&mut self) {
         self.ctx.record_err(self.ctx.bind_to_thread());
+        let blocks = (self.ctx.block_cache.lock().unwrap().as_mut())
+            .map(|cache| cache.drain(|stream| stream.is(self.cu_stream)));
+        for (stream, block) in blocks.into_iter().flatten() {
+            self.ctx
+                .record_err(unsafe { result::free_async(block, stream.stream()) });
+        }
         let cu_stream = std::mem::replace(&mut self.cu_stream, std::ptr::null_mut());
         if !cu_stream.is_null() && cu_stream != (0x2 as _) {
             self.ctx.num_streams.fetch_sub(1, Ordering::Relaxed);
@@ -781,6 +838,16 @@ impl CudaStream {
     }
 }
 
+/// Where the memory of a [CudaSlice] comes from, and so where it goes when freed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The driver, back to which it goes.
+    Driver,
+    /// The block cache's blocks for allocations on a stream, which it goes back to when freed on
+    /// that stream outside capture.
+    Cache(StreamKey),
+}
+
 /// `Vec<T>` on a cuda device. You can allocate and modify this with [CudaStream].
 ///
 /// This object is thread safe.
@@ -792,6 +859,8 @@ pub struct CudaSlice<T> {
     pub(crate) write: Option<CudaEvent>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) marker: PhantomData<*const T>,
+    /// Where the memory comes from, and so where it goes when freed.
+    pub(crate) origin: Origin,
 }
 
 unsafe impl<T> Send for CudaSlice<T> {}
@@ -807,6 +876,13 @@ impl<T> Drop for CudaSlice<T> {
             ctx.record_err(self.stream.wait(write));
         }
         if ctx.has_async_alloc {
+            let bytes = self.len * std::mem::size_of::<T>();
+            if self
+                .stream
+                .cache_freed(self.cu_device_ptr, bytes, self.origin)
+            {
+                return;
+            }
             ctx.record_err(unsafe {
                 result::free_async(self.cu_device_ptr, self.stream.cu_stream)
             });
@@ -1521,7 +1597,53 @@ impl CudaStream {
             write: None,
             stream: self.clone(),
             marker: PhantomData,
+            origin: Origin::Driver,
         })
+    }
+
+    /// Device memory for `bytes` on this stream, and where it comes from.
+    unsafe fn alloc_block(&self, bytes: usize) -> Result<(sys::CUdeviceptr, Origin), DriverError> {
+        let (class, stream) = (size_class(bytes), StreamKey::of(self.cu_stream));
+        let reused = {
+            let mut cache = self.ctx.block_cache.lock().unwrap();
+            match cache.as_mut() {
+                Some(blocks) if bytes > 0 && !self.is_capturing()? => {
+                    Some(blocks.take(stream, class))
+                }
+                _ => None,
+            }
+        };
+        match reused {
+            None => Ok((result::malloc_async(self.cu_stream, bytes)?, Origin::Driver)),
+            Some(Some(block)) => Ok((block, Origin::Cache(stream))),
+            Some(None) => match result::malloc_async(self.cu_stream, class) {
+                Err(DriverError(sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY)) => {
+                    self.ctx.release_cached_blocks()?;
+                    let block = result::malloc_async(self.cu_stream, class)?;
+                    Ok((block, Origin::Cache(stream)))
+                }
+                block => Ok((block?, Origin::Cache(stream))),
+            },
+        }
+    }
+
+    /// Whether `block`, of the size class of `bytes`, from `origin`, went back to the block cache:
+    /// a cached block does when freed on the stream it was allocated for, outside capture. The
+    /// per-thread stream of another thread is another stream.
+    fn cache_freed(&self, block: sys::CUdeviceptr, bytes: usize, origin: Origin) -> bool {
+        let Origin::Cache(stream) = origin else {
+            return false;
+        };
+        if !stream.is(self.cu_stream) || self.is_capturing().unwrap_or(true) {
+            return false;
+        }
+        let mut cache = self.ctx.block_cache.lock().unwrap();
+        (cache.as_mut()).is_some_and(|blocks| blocks.put(stream, size_class(bytes), block))
+    }
+
+    fn is_capturing(&self) -> Result<bool, DriverError> {
+        let status = unsafe { result::stream::is_capturing(self.cu_stream) }?;
+        Ok(status != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
     }
 
     /// Allocates a [CudaSlice] with `len` elements of type `T`.
@@ -1532,10 +1654,11 @@ impl CudaStream {
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
-        let cu_device_ptr = if self.ctx.has_async_alloc {
-            result::malloc_async(self.cu_stream, len * std::mem::size_of::<T>())?
+        let bytes = len * std::mem::size_of::<T>();
+        let (cu_device_ptr, origin) = if self.ctx.has_async_alloc {
+            self.alloc_block(bytes)?
         } else {
-            result::malloc_sync(len * std::mem::size_of::<T>())?
+            (result::malloc_sync(bytes)?, Origin::Driver)
         };
         let (read, write) = if self.ctx.is_event_tracking() {
             (
@@ -1552,6 +1675,7 @@ impl CudaStream {
             write,
             stream: self.clone(),
             marker: PhantomData,
+            origin,
         })
     }
 
@@ -2513,6 +2637,7 @@ impl CudaStream {
             write,
             stream: self.clone(),
             marker: PhantomData,
+            origin: Origin::Driver,
         }
     }
 }
@@ -2522,6 +2647,86 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn test_block_cache_reuses_blocks_on_their_stream() {
+        let ctx = CudaContext::new(0).unwrap();
+        assert!(ctx.has_async_alloc());
+        ctx.cache_freed_blocks(1 << 20);
+        let stream = ctx.new_stream().unwrap();
+        let other = ctx.new_stream().unwrap();
+        let first = unsafe { stream.alloc::<f32>(1000) }.unwrap();
+        let block = first.cu_device_ptr;
+        drop(first);
+        assert_eq!(ctx.cached_bytes(), 4096);
+        let elsewhere = unsafe { other.alloc::<f32>(1000) }.unwrap();
+        assert_ne!(elsewhere.cu_device_ptr, block);
+        let again = unsafe { stream.alloc::<u8>(3600) }.unwrap();
+        assert_eq!(again.cu_device_ptr, block);
+        assert_eq!(ctx.cached_bytes(), 0);
+        drop((elsewhere, again));
+        assert_eq!(ctx.cached_bytes(), 8192);
+        drop(other);
+        assert_eq!(ctx.cached_bytes(), 4096);
+        ctx.release_cached_blocks().unwrap();
+        assert_eq!(ctx.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn test_block_cache_keeps_per_thread_blocks_to_their_thread() {
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.cache_freed_blocks(1 << 20);
+        let stream = ctx.per_thread_stream();
+        let block = unsafe { stream.alloc::<f32>(1000) }.unwrap();
+        // Another thread's per-thread stream is another stream.
+        let there = ctx.clone();
+        std::thread::spawn(move || {
+            // Dropping a slice binds no context unless it waits for its events.
+            there.bind_to_thread().unwrap();
+            drop(block)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(ctx.cached_bytes(), 0);
+        drop(unsafe { stream.alloc::<f32>(1000) }.unwrap());
+        assert_eq!(ctx.cached_bytes(), 4096);
+    }
+
+    #[test]
+    fn test_block_cache_keeps_to_its_limit() {
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.cache_freed_blocks(6000);
+        let stream = ctx.new_stream().unwrap();
+        let blocks: Vec<_> = (0..2)
+            .map(|_| unsafe { stream.alloc::<u8>(4096) }.unwrap())
+            .collect();
+        drop(blocks);
+        assert_eq!(ctx.cached_bytes(), 4096);
+    }
+
+    #[test]
+    fn test_block_cache_skips_capture() {
+        let ctx = CudaContext::new(0).unwrap();
+        ctx.cache_freed_blocks(1 << 20);
+        let stream = ctx.new_stream().unwrap();
+        stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .unwrap();
+        let captured = unsafe { stream.alloc::<f32>(1000) }.unwrap();
+        assert_eq!(captured.origin, Origin::Driver);
+        drop(captured);
+        let graph = stream
+            .end_capture(
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+            )
+            .unwrap();
+        assert!(graph.is_some());
+        assert_eq!(ctx.cached_bytes(), 0);
+        let eager = unsafe { stream.alloc::<f32>(1000) }.unwrap();
+        assert!(matches!(eager.origin, Origin::Cache(_)));
+        drop(eager);
+        assert_eq!(ctx.cached_bytes(), 4096);
+    }
 
     #[test]
     fn test_transmutes() {
