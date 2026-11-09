@@ -1,6 +1,9 @@
 use crate::driver::{
     result::{self, DriverError},
-    safe::block_cache::{size_class, BlockCache, StreamKey},
+    safe::{
+        block_cache::{size_class, BlockCache, StreamKey},
+        capture_pool::PoolCapture,
+    },
     sys::{self, CUfunc_cache_enum, CUfunction_attribute_enum},
 };
 
@@ -43,6 +46,10 @@ pub struct CudaContext {
     pub(crate) error_state: AtomicU32,
     /// Freed blocks kept for reuse, once [CudaContext::cache_freed_blocks] is called.
     pub(crate) block_cache: Mutex<Option<BlockCache>>,
+    /// Captures into a [CapturePool](super::CapturePool) in progress, by stream.
+    pub(crate) pool_captures: Mutex<Vec<(StreamKey, PoolCapture)>>,
+    /// How many captures `pool_captures` holds, read without its lock.
+    pub(crate) num_pool_captures: AtomicUsize,
 }
 
 unsafe impl Send for CudaContext {}
@@ -95,6 +102,8 @@ impl CudaContext {
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
             block_cache: Mutex::new(None),
+            pool_captures: Mutex::new(Vec::new()),
+            num_pool_captures: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -168,6 +177,8 @@ impl CudaContext {
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
             block_cache: Mutex::new(None),
+            pool_captures: Mutex::new(Vec::new()),
+            num_pool_captures: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -220,6 +231,8 @@ impl CudaContext {
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
             block_cache: Mutex::new(None),
+            pool_captures: Mutex::new(Vec::new()),
+            num_pool_captures: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -258,6 +271,8 @@ impl CudaContext {
             event_tracking: AtomicBool::new(true),
             error_state: AtomicU32::new(0),
             block_cache: Mutex::new(None),
+            pool_captures: Mutex::new(Vec::new()),
+            num_pool_captures: AtomicUsize::new(0),
         });
         ctx.bind_to_thread()?;
         Ok(ctx)
@@ -839,13 +854,15 @@ impl CudaStream {
 }
 
 /// Where the memory of a [CudaSlice] comes from, and so where it goes when freed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum Origin {
     /// The driver, back to which it goes.
     Driver,
     /// The block cache's blocks for allocations on a stream, which it goes back to when freed on
     /// that stream outside capture.
     Cache(StreamKey),
+    /// A capture's allocations from a [CapturePool](super::CapturePool), which go back to it.
+    Pool(PoolCapture),
 }
 
 /// `Vec<T>` on a cuda device. You can allocate and modify this with [CudaStream].
@@ -875,11 +892,15 @@ impl<T> Drop for CudaSlice<T> {
         if let Some(write) = self.write.as_ref() {
             ctx.record_err(self.stream.wait(write));
         }
+        if let Origin::Pool(capture) = &self.origin {
+            capture.free(self.cu_device_ptr);
+            return;
+        }
         if ctx.has_async_alloc {
             let bytes = self.len * std::mem::size_of::<T>();
             if self
                 .stream
-                .cache_freed(self.cu_device_ptr, bytes, self.origin)
+                .cache_freed(self.cu_device_ptr, bytes, &self.origin)
             {
                 return;
             }
@@ -1630,8 +1651,8 @@ impl CudaStream {
     /// Whether `block`, of the size class of `bytes`, from `origin`, went back to the block cache:
     /// a cached block does when freed on the stream it was allocated for, outside capture. The
     /// per-thread stream of another thread is another stream.
-    fn cache_freed(&self, block: sys::CUdeviceptr, bytes: usize, origin: Origin) -> bool {
-        let Origin::Cache(stream) = origin else {
+    fn cache_freed(&self, block: sys::CUdeviceptr, bytes: usize, origin: &Origin) -> bool {
+        let &Origin::Cache(stream) = origin else {
             return false;
         };
         if !stream.is(self.cu_stream) || self.is_capturing().unwrap_or(true) {
@@ -1655,7 +1676,9 @@ impl CudaStream {
     ) -> Result<CudaSlice<T>, DriverError> {
         self.ctx.bind_to_thread()?;
         let bytes = len * std::mem::size_of::<T>();
-        let (cu_device_ptr, origin) = if self.ctx.has_async_alloc {
+        let (cu_device_ptr, origin) = if let Some(capture) = self.pool_capture()? {
+            (capture.alloc(bytes)?, Origin::Pool(capture))
+        } else if self.ctx.has_async_alloc {
             self.alloc_block(bytes)?
         } else {
             (result::malloc_sync(bytes)?, Origin::Driver)
@@ -2582,7 +2605,8 @@ impl CudaFunction {
 
 impl<T> CudaSlice<T> {
     /// Takes ownership of the underlying [sys::CUdeviceptr]. **It is up
-    /// to the owner to free this value**.
+    /// to the owner to free this value**, except for memory of a
+    /// [CapturePool](super::CapturePool): that stays the pool's, which then lives on.
     ///
     /// Drops the underlying host_buf if there is one.
     pub fn leak(self) -> sys::CUdeviceptr {
@@ -2713,7 +2737,7 @@ mod tests {
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .unwrap();
         let captured = unsafe { stream.alloc::<f32>(1000) }.unwrap();
-        assert_eq!(captured.origin, Origin::Driver);
+        assert!(matches!(captured.origin, Origin::Driver));
         drop(captured);
         let graph = stream
             .end_capture(
@@ -2726,6 +2750,30 @@ mod tests {
         assert!(matches!(eager.origin, Origin::Cache(_)));
         drop(eager);
         assert_eq!(ctx.cached_bytes(), 4096);
+    }
+
+    #[test]
+    fn test_block_cache_leaves_pool_captures_to_their_pool() {
+        let ctx = CudaContext::new(0).unwrap();
+        // As a model running on one stream sets it up.
+        unsafe { ctx.disable_event_tracking() };
+        ctx.cache_freed_blocks(1 << 20);
+        let stream = ctx.per_thread_stream();
+        drop(unsafe { stream.alloc::<f32>(1000) }.unwrap());
+        assert_eq!(ctx.cached_bytes(), 4096);
+        let pool = crate::driver::CapturePool::new(&stream);
+        stream.begin_capture_in(&pool).unwrap();
+        let mut captured = unsafe { stream.alloc::<f32>(1000) }.unwrap();
+        assert!(matches!(captured.origin, Origin::Pool(_)));
+        stream.memset_zeros(&mut captured).unwrap();
+        drop(captured);
+        let flags = sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+        let graph = stream.end_capture(flags).unwrap().unwrap();
+        assert_eq!(ctx.cached_bytes(), 4096);
+        graph.launch().unwrap();
+        let eager = unsafe { stream.alloc::<f32>(1000) }.unwrap();
+        assert!(matches!(eager.origin, Origin::Cache(_)));
+        stream.synchronize().unwrap();
     }
 
     #[test]
